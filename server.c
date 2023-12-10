@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "utils.h"
 
@@ -12,11 +14,11 @@ size_t slide_window(struct queue **window_start, FILE *fp) {
     if ((*window_start)->last) return 0;
     // Find first nonused segment in window
     struct queue *cur_window_seg = *window_start;
-//    printf("Window\nOLD:   ");
-//    for (size_t j = 0; j < 6; ++j){
-//        printf("%i    ", cur_window_seg->seqnum);
-//        cur_window_seg = cur_window_seg->next;
-//    }
+    printf("Window\nOLD:   ");
+    for (size_t j = 0; j < 6; ++j){
+        printf("(%i, %i)    ", cur_window_seg->seqnum, cur_window_seg->used);
+        cur_window_seg = cur_window_seg->next;
+    }
     (*window_start)->used = 0;
     (*window_start)->seqnum = 0;
     (*window_start)->length = 0;
@@ -38,12 +40,12 @@ size_t slide_window(struct queue **window_start, FILE *fp) {
 	cur_window_seg = cur_window_seg->next;
     }
     *window_start = cur_window_seg;
-//    printf("Window\nNEW:   ");
-//    for (size_t j = 0; j < 6; ++j){
-//	printf("%i    ", cur_window_seg->seqnum);
-//	cur_window_seg = cur_window_seg->next;
-//    }
-//    printf("\n");
+    printf("Window\nNEW:   ");
+    for (size_t j = 0; j < 6; ++j){
+	printf("(%i, %i)    ", cur_window_seg->seqnum, cur_window_seg->used);
+	cur_window_seg = cur_window_seg->next;
+    }
+    printf("\n");
     return i;
 } 
 
@@ -54,6 +56,9 @@ int main() {
     socklen_t addr_size = sizeof(client_addr_from);
     int expected_seq_num = 0;
     struct packet ack_pkt;
+    struct timeval timeout;
+    timeout.tv_sec = TIMEOUT_SEC;
+    timeout.tv_usec = TIMEOUT_USEC;
 
     // Create a UDP socket for sending
     send_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -108,6 +113,19 @@ int main() {
 
     int window_change = 0;
     while(1){
+	if (window_start->last) {
+	    fd_set read_fds;
+	    FD_ZERO(&read_fds);
+            FD_SET(listen_sockfd, &read_fds);
+            int select_result = select(listen_sockfd + 1, &read_fds, NULL, NULL, &timeout);
+	    if (select_result <= 0) {
+		printf("Timed out at end!\n");
+		build_packet(&ack_pkt, 1, expected_seq_num, 0, 1, 1, "0");
+                sendto(send_sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&client_addr_to, addr_size);
+                printSend(&ack_pkt, 0);
+		continue;
+    	    }
+	}
         recvfrom(listen_sockfd, &buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr_from, &addr_size);
 	printRecv(&buffer);
 

@@ -254,10 +254,15 @@ int main(int argc, char *argv[]) {
 	printRecv(&ack_pkt);
 	if (ack_pkt.seqnum) {
 	    build_packet(&pkt, cur_window_seg->seqnum, 1, 1, ack, cur_window_seg->length, cur_window_seg->payload);
+	    //sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+	    //sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+	    //sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+	    //sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+	    //sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
 	    gettimeofday(&instant_time,NULL);
             end_start_time = (unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec);
 	    printf("Sending FIN messages until timeout\n");
-	    while ((unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec) - end_start_time < (unsigned long)(TIMEOUT_SEC*1000000+TIMEOUT_USEC)) {
+	    while ((unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec) - end_start_time < (unsigned long)(2*TIMEOUT_SEC*1000000+TIMEOUT_USEC)) {
                 sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
 		gettimeofday(&instant_time, NULL);
 	    }
