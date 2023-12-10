@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,28 +9,16 @@
 
 #include "utils.h"
 
-// Slide client window, return number of segments in new window
-void slide_window(struct packet *window [WINDOW_SIZE], size_t positions_to_slide, short *num_segments_in_window) {
-    for (size_t i = positions_to_slide; i < WINDOW_SIZE; ++i)
-	window[i-positions_to_slide] = window[i];
-    *num_segments_in_window -= positions_to_slide;
-}
-
 int main(int argc, char *argv[]) {
-    int listen_sockfd, send_sockfd;
+    int listen_sockfd, send_sockfd, select_fd;
     struct sockaddr_in client_addr, server_addr_to, server_addr_from;
     socklen_t addr_size = sizeof(server_addr_to);
-    struct timeval tv;
     struct packet pkt;
     struct packet ack_pkt;
     char buffer[PAYLOAD_SIZE];
-    unsigned short seq_num = 0;
-    unsigned short ack_num = 0;
-    char last = 0;
+    unsigned int ack_num = 0;
+    int last = -1;
     char ack = 0;
-
-    tv.tv_sec = TIMEOUT;
-    tv.tv_usec = 0;
 
     // read filename from command line argument
     if (argc != 2) {
@@ -42,12 +31,6 @@ int main(int argc, char *argv[]) {
     listen_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (listen_sockfd < 0) {
         perror("Could not create listen socket");
-        return 1;
-    }
-
-    // Listen socket timeout
-    if (setsockopt(listen_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        perror("Could not set listen socket timeout");
         return 1;
     }
 
@@ -78,96 +61,355 @@ int main(int argc, char *argv[]) {
     }
 
     // Open file for reading
-    FILE *fp = fopen(filename, "r");
+    FILE *fp = fopen(filename, "rb");
     if (fp == NULL) {
         perror("Error opening file");
         close(listen_sockfd);
         close(send_sockfd);
         return 1;
     }
-
+    
+    ssize_t bytes_read;
+    struct timeval timeout;
+    timeout.tv_sec = TIMEOUT_SEC;
+    timeout.tv_usec = TIMEOUT_USEC;
+    
     // TODO: Read from file, and initiate reliable data transfer to the server
+    struct queue *window_start;
+    struct queue *cur_window_seg;
+    struct queue nodes[MAX_SEQUENCE];
+    for (size_t i = 0; i < MAX_SEQUENCE-1; ++i) {
+        nodes[i].next = &nodes[i+1];
+        nodes[i].used = 0;
+	nodes[i].seqnum = 0;
+    }
+    nodes[MAX_SEQUENCE-1].next = &nodes[0];
+    nodes[MAX_SEQUENCE-1].used = 0;
+    nodes[MAX_SEQUENCE-1].seqnum = 0;
+    window_start = &(nodes[0]);
 
-    // Connect send socket to the server address to which we will send data
-    if (connect(send_sockfd, (struct sockaddr *)&server_addr_to, sizeof(server_addr_to)) < 0) {
-	perror("Server failed to connect to proxy server");
-	close(send_sockfd);
-	return 1;
-   }
+    unsigned long timestamps[MAX_SEQUENCE] = {0};
 
-    // Partition file into packets and send to server
-    size_t bytes_read;
-    ssize_t listen_socket_state;
-    struct packet *window_packets [WINDOW_SIZE];
-    short num_segments_in_window = 0;
-    while (1) {
-	// If room in our window, send a new segment
-	if (num_segments_in_window < WINDOW_SIZE) {
-	    bytes_read = fread(buffer, 1, PAYLOAD_SIZE, fp);
-	    // Done reading file
-	    if (!bytes_read) {
-		break;
+    float cwnd = 1;
+    int ssthresh = 6;
+    int dup_ack = 0;
+    int prev_ack = 0;
+    float cwnd_change = 0;
+    int high_seq_num = 0;
+    int start_seq_num = 0;
+    int cur_seq_num = 0;
+    char in_timeout = 0;
+    char fr_running = 0;
+    struct timeval instant_time;
+    int ca_freq = 0;
+    fd_set read_fds;
+    char done_timeout = 0;
+    unsigned int timeout_start_time;
+    int last_transmitted = MAX_SEQUENCE;
+    ssize_t bytes_recv;
+    select_fd = listen_sockfd;
+    int transmitting_timeout = 0;
+    int high_seq_lim = 0;
+    unsigned long end_start_time;
+    while(1){
+	if ((in_timeout && transmitting_timeout) || (dup_ack == 3 && fr_running)) /* && last_transmitted != (int)window_start->seqnum*/ {
+	    //printf("HIII!!!\n");
+	    if (last != window_start->seqnum)
+	    	build_packet(&pkt, window_start->seqnum, ack_num, 0, ack, window_start->length, window_start->payload);
+	    else
+		build_packet(&pkt, window_start->seqnum, ack_num, 1, ack, window_start->length, window_start->payload);
+	    //printf("YOOOO\n");
+	    sendto(send_sockfd, &(pkt), sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+	    gettimeofday(&instant_time,NULL);
+	    timestamps[window_start->seqnum] = (unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec);
+	    last_transmitted = window_start->seqnum;
+	    printSend(&pkt, 0);
+	    printf("Retransmission sent!\n");
+	    fr_running = 0;
+	    if (in_timeout) {
+		dup_ack = 1;
+		transmitting_timeout = 0;
 	    }
-	    
 
-	    // Create packet to send to server
-	    build_packet(&pkt, seq_num, ack_num, last, ack, bytes_read, (const char*)buffer);
-
-	    // Send segment to server socket
-	    if (send(send_sockfd, &pkt, sizeof(pkt), 0) < 0) {
-		perror("Error sending request");
-		close(send_sockfd);
-		return 1;
+	} else if (!in_timeout && 0 < (int)cwnd && !(last_transmitted == window_start->seqnum && (int) cwnd == 1)) {
+	    cur_window_seg = window_start;
+	    if (start_seq_num <= high_seq_num && high_seq_num-start_seq_num<(int)MAX_SEQUENCE/2)
+	    	for (int i = start_seq_num; i < (high_seq_num); ++i) cur_window_seg = cur_window_seg->next;
+	    else if (high_seq_num < 2*WINDOW_SIZE && start_seq_num > MAX_SEQUENCE-(2*WINDOW_SIZE))
+		for (int i = start_seq_num; i < MAX_SEQUENCE+high_seq_num; ++i) cur_window_seg = cur_window_seg->next;
+	    if (last >= 0)
+		high_seq_lim = last + 1;
+	    else if (start_seq_num + (int)cwnd < 2*WINDOW_SIZE && high_seq_num > MAX_SEQUENCE-(2*WINDOW_SIZE))
+		high_seq_lim = start_seq_num + (int)cwnd + MAX_SEQUENCE; 
+	    else if (start_seq_num + (int)cwnd > MAX_SEQUENCE-(2*WINDOW_SIZE) && high_seq_num < (2*WINDOW_SIZE))
+		high_seq_lim = (start_seq_num + (int)cwnd) % MAX_SEQUENCE;
+	    else
+		high_seq_lim = start_seq_num + (int)cwnd;
+	    for (; high_seq_num < high_seq_lim; ++high_seq_num)
+	    {
+		cur_seq_num = high_seq_num % MAX_SEQUENCE;
+		//printf("0\n");
+		if (!cur_window_seg->used) {
+		    //printf("1\n");
+		    bytes_read = fread(buffer, 1, PAYLOAD_SIZE, fp);
+		    //printf("2\n");
+		    if (bytes_read == -1) {
+			perror("Error reading from file");
+			fclose(fp);
+			close(listen_sockfd);
+			close(send_sockfd);
+			return 1;
+		    }
+		    //else if (bytes_read == 0)
+		//	break;
+		    else if (bytes_read < PAYLOAD_SIZE) {
+			last = cur_seq_num;
+			printf("Last packet found! %li bytes read! Seqnum is: %i\n", bytes_read, cur_seq_num);
+		    }
+		    //printf("3\n");
+		    memcpy(cur_window_seg->payload, (const char *)buffer, bytes_read);
+		    //printf("4\n");
+		    cur_window_seg->seqnum = cur_seq_num;
+		    cur_window_seg->length = bytes_read;
+		    cur_window_seg->used = 1;
+		    if (last == cur_seq_num)
+			build_packet(&pkt, cur_seq_num, ack_num, 1, ack, cur_window_seg->length, cur_window_seg->payload);
+		    else
+			build_packet(&pkt, cur_seq_num, ack_num, 0, ack, cur_window_seg->length, cur_window_seg->payload);
+		    //printf("5\n");
+		    last_transmitted = cur_seq_num;
+		} else {
+		    //printf("7\n");
+		    if (last == cur_seq_num)
+      	            	build_packet(&pkt, cur_window_seg->seqnum, ack_num, 1, ack, cur_window_seg->length, cur_window_seg->payload);
+		    else
+			build_packet(&pkt, cur_window_seg->seqnum, ack_num, 0, ack, cur_window_seg->length, cur_window_seg->payload);
+		    //printf("6\n");
+		    last_transmitted = cur_seq_num;
+		    printf("Packet already cached! window->seqnum: %i, cur_seq_num: %i\n", cur_window_seg->seqnum, cur_seq_num);
+		}
+		//printf("8\n");
+		sendto(send_sockfd, &(pkt), sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+		printSend(&pkt, 0);
+		gettimeofday(&instant_time,NULL);
+		timestamps[cur_seq_num] = (unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec);
+		if (last == cur_seq_num)
+		    break;
+		cur_window_seg = cur_window_seg->next;
 	    }
-	    window_packets[num_segments_in_window] = &pkt;
-    	    ++num_segments_in_window;
+	    high_seq_num = high_seq_num % MAX_SEQUENCE;
 	}
 
-        // Read ACK from server
-	listen_socket_state = recv(listen_sockfd, &ack_pkt, sizeof(ack_pkt), 0);	
-        if (listen_socket_state < 0) {
-	    if ((errno != EAGAIN) && (errno != EWOULDBLOCK)) {
-		perror("Read error or closed from server");
-	    	close(listen_sockfd);
-       	        close(send_sockfd);
-                fclose(fp);
-		return 1;
-	    }
-	    // Retransmit first segment from window upon ACK timeout
-	    printf("Listen socket timed out! Retransmitting first segment in window\n");
-	    if (send(send_sockfd, window_packets[0], sizeof(*(window_packets[0])), 0) < 0) {
-		perror("Error sending request");
-		close(send_sockfd);
-		return 1;
-	    }
+	// Handle timeouts	
+	FD_ZERO(&read_fds);
+        FD_SET(select_fd, &read_fds);
+
+	int select_result = select(select_fd + 1, &read_fds, NULL, NULL, &timeout);
+
+	if (dup_ack > WINDOW_SIZE) { // force timeout
+            dup_ack = 1;
+	    if (cwnd/2 > 2)
+		ssthresh = (int)cwnd/2;
+	    else
+		ssthresh = 2;
+	    cwnd = 1;
+	    high_seq_num = start_seq_num;
+	    in_timeout = 1;	   
+	    transmitting_timeout = 1;
+	    printf("Forcing timeout!\n");
 	    continue;
 	}
 
-	// ACK policy --> all cases are written out right now in case of errors
-	if (!ack_pkt.ack) {
-	    printf("No ACK received in client. Current seqnum is %i\n", seq_num);
+	if (select_result == -1) {
+	    perror("Error in select");
+	    fclose(fp);
+	    close(listen_sockfd);
+	    close(send_sockfd);
+	    return 1;
+	}
+	else if (select_result == 0) {
+	    if (!timestamps[start_seq_num]) {
+		printf("timestamp error\n");
+		return 1;
+	    }
+	    gettimeofday(&instant_time,NULL);
+	    if ((unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec) - timestamps[start_seq_num] > (unsigned long)(TIMEOUT_SEC*1000000+TIMEOUT_USEC)) {
+		dup_ack = 1;
+	        printf("Timeout occurred. Retransmitting packet: %i\n", start_seq_num);
+		if (cwnd/2 > 2)
+		    ssthresh = (int)cwnd/2;
+		else
+		    ssthresh = 2;
+		cwnd = 1;
+		timeout.tv_sec = TIMEOUT_SEC;
+		timeout.tv_usec = TIMEOUT_USEC;
+		high_seq_num = start_seq_num;
+	     //   printf("Start_seq_num, %i, Actual first window seqnum: %i, high_seq_num: %i\n", start_seq_num, window_start->seqnum, high_seq_num);
+		in_timeout = 1;
+		transmitting_timeout = 1;
+	    }
+	    continue;
+	}
+	bytes_recv = recvfrom(listen_sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&server_addr_from, &addr_size);
+	printRecv(&ack_pkt);
+	if (ack_pkt.seqnum) {
+	    build_packet(&pkt, cur_window_seg->seqnum, 1, 1, ack, cur_window_seg->length, cur_window_seg->payload);
+	    gettimeofday(&instant_time,NULL);
+            end_start_time = (unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec);
+	    printf("Sending FIN messages until timeout\n");
+	    while ((unsigned long)(1000000*instant_time.tv_sec+instant_time.tv_usec) - end_start_time < (unsigned long)(TIMEOUT_SEC*1000000+TIMEOUT_USEC)) {
+                sendto(send_sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr_to, addr_size);
+		gettimeofday(&instant_time, NULL);
+	    }
+            printSend(&pkt, 0);   
+	    break;
+	}
+	if ((prev_ack < 2*WINDOW_SIZE && ack_pkt.acknum > MAX_SEQUENCE-(2*WINDOW_SIZE)) || (prev_ack-ack_pkt.acknum < (int)MAX_SEQUENCE/2 && prev_ack-ack_pkt.acknum>0))
+	    ack_pkt.acknum = prev_ack;
+	if (ack_pkt.acknum == last) {
+	    cwnd = 1;
+	    start_seq_num = last;
+	    in_timeout = 1;
+	    transmitting_timeout = 1;
+	    continue;
 	}
 
-	if (ack_pkt.acknum > (MAX_SEQUENCE - 2*WINDOW_SIZE) && seq_num < 2*WINDOW_SIZE) 
-	    ++seq_num; // ACK is behind seqnum in wraparound case, so prepare to send next segment
-	else if (seq_num > (MAX_SEQUENCE - 2*WINDOW_SIZE) && ack_pkt.acknum < 2*WINDOW_SIZE) {
-	    slide_window(window_packets, (size_t) (WINDOW_SIZE-seq_num + ack_pkt.acknum), &num_segments_in_window);
-	    seq_num = ack_pkt.acknum; // seq_num is behind ACK in wraparound case
-	} else if (seq_num < ack_pkt.acknum) {
-	    slide_window(window_packets, (size_t)(ack_pkt.acknum-seq_num), &num_segments_in_window);
-	    seq_num = ack_pkt.acknum; // seq_num is behind ACK in traditional case
-	} else if (seq_num > ack_pkt.acknum)
-	    ++seq_num; // ACK is behind seqnum in traditional case
-	else if (seq_num == ack_pkt.acknum)
-	   continue; // perfect
-	else
-	   printf("Don't think this is a possible case\n");
+	if (bytes_recv > 0) {
+	    if (ack_pkt.acknum == (unsigned int)prev_ack)
+		dup_ack++;
+	    else if (dup_ack > 1){
+		if (dup_ack >= 3) { // Done with fast recovery
+		    if (ack_pkt.acknum >= start_seq_num)
+		    	cwnd_change = (ack_pkt.acknum - start_seq_num);
+		    else
+			cwnd_change = MAX_SEQUENCE - start_seq_num + ack_pkt.acknum;
+		    cur_window_seg = window_start;
+		    for (size_t i = 0; i < (size_t)cwnd_change; ++i) {
+			cur_window_seg->seqnum = 0;
+			cur_window_seg->used = 0;
+			cur_window_seg = cur_window_seg->next;
+		    }
+		    window_start = cur_window_seg;
+		    start_seq_num = ack_pkt.acknum;
+		    cwnd = (float) ssthresh; // Done with fast recovery
+		    if (start_seq_num > high_seq_num) high_seq_num = start_seq_num;
+		    else if (high_seq_num > MAX_SEQUENCE - (2*WINDOW_SIZE) && start_seq_num < (2*WINDOW_SIZE)) high_seq_num = start_seq_num;
+		    printf("END FR: Window size: %f, window start seqnum: %i, real window start: %i\n", cwnd, start_seq_num, window_start->seqnum);
+		    dup_ack = 1;
+		    continue;
+		}
+		dup_ack = 1;
+	    }
 
-	printf("Num segs in window: %i\n", num_segments_in_window);	
-	  
+	    // Fast Retransmit
+	    if (dup_ack == 3) {
+		fr_running = 1;
+		ca_freq = 0;
+		cwnd = (float)(int)cwnd;
+		cwnd_change = ssthresh/2;
+		if (cwnd_change > 2)
+		    ssthresh = (size_t)cwnd_change;
+		else
+		    ssthresh = 2;
+		printf("3 dup ACKs! Starting FR! Retransmitting seqnum: %i. New ssthres: %i, cwnd: %i\n", window_start->seqnum, ssthresh, (int) cwnd);
+		continue;
+	    }
+
+	    if (high_seq_num < ack_pkt.acknum && ack_pkt.acknum-high_seq_num<(int)MAX_SEQUENCE/2)
+		high_seq_num = ack_pkt.acknum;
+	    else if (high_seq_num > MAX_SEQUENCE - (2*WINDOW_SIZE) && ack_pkt.acknum < (2*WINDOW_SIZE)) 
+		high_seq_num = ack_pkt.acknum; 
+
+	    // Fast recovery
+	    if (dup_ack > 3) 
+		cwnd++;
+
+	    // Slow start
+	    else if ((int)cwnd <= ssthresh) {
+		if (ack_pkt.acknum > (unsigned int)start_seq_num) {
+		    cwnd_change = (ack_pkt.acknum - start_seq_num);
+		    cur_window_seg = window_start;
+		    for (size_t i = 0; i < (size_t)cwnd_change; ++i) {
+			cur_window_seg->seqnum = 0;
+			cur_window_seg->used = 0;
+			cur_window_seg = cur_window_seg->next;
+		    } if (cwnd+cwnd_change > WINDOW_SIZE)
+			cwnd_change = WINDOW_SIZE-cwnd;
+		    if (cwnd_change > 1) cwnd_change = 1;
+		    cwnd += cwnd_change;
+		    start_seq_num = ack_pkt.acknum;
+		    window_start = cur_window_seg;
+		}
+		else if (start_seq_num > (MAX_SEQUENCE-(2*WINDOW_SIZE)) && ack_pkt.acknum < 2*WINDOW_SIZE) {
+		    cwnd_change = MAX_SEQUENCE-start_seq_num+ack_pkt.acknum;	 
+		    cur_window_seg = window_start;
+		    for (size_t i = 0; i < (size_t)cwnd_change; ++i) {
+			cur_window_seg->seqnum = 0;
+			cur_window_seg->used = 0;
+			cur_window_seg = cur_window_seg->next;
+		    } if (cwnd+cwnd_change > WINDOW_SIZE)
+			cwnd_change = WINDOW_SIZE-cwnd;
+		    if (cwnd_change > 1) cwnd_change = 1;
+		    cwnd += cwnd_change;
+		    start_seq_num = ack_pkt.acknum;
+		    window_start = cur_window_seg;
+		}	
+	    }
+	    else { // Congestion Avoidance
+		printf("In congestion avoidance\n");
+		if (ack_pkt.acknum > start_seq_num) {
+		    ++ca_freq;
+		    cwnd_change = (float)ca_freq/cwnd;
+		    cur_window_seg = window_start;
+		    for (int i = 0; i < (int)(ack_pkt.acknum - start_seq_num); ++i) {
+			cur_window_seg->seqnum = 0;
+			cur_window_seg->used = 0;
+			cur_window_seg = cur_window_seg->next;
+		    } if (cwnd + cwnd_change > WINDOW_SIZE)
+			cwnd_change = WINDOW_SIZE-cwnd;
+		    cwnd_change = (float)(int)cwnd_change;
+		    if (cwnd_change) ca_freq = 0;
+		    cwnd += (float)(int)cwnd_change;
+		    start_seq_num = ack_pkt.acknum;
+		    window_start = cur_window_seg;
+	        }
+		else if (start_seq_num > (MAX_SEQUENCE-(2*WINDOW_SIZE)) && ack_pkt.acknum < 2*WINDOW_SIZE) {
+		    cwnd_change = (float)ca_freq/cwnd;
+		    cur_window_seg = window_start;
+		    for (int i = 0; i < (int)(MAX_SEQUENCE-start_seq_num+ack_pkt.acknum); ++i) {
+			cur_window_seg->seqnum = 0;
+			cur_window_seg->used = 0;
+			cur_window_seg = cur_window_seg->next;
+			} 
+		    if (cwnd + cwnd_change > WINDOW_SIZE)
+			cwnd_change = WINDOW_SIZE-cwnd;
+		    cwnd_change = (float)(int)cwnd_change;
+		    if (cwnd_change) ca_freq = 0;
+		    cwnd += (float)(int)cwnd_change;
+		    start_seq_num = ack_pkt.acknum;
+		    window_start = cur_window_seg;
+		}	
+	    }
+	    prev_ack = ack_pkt.acknum;
+	    printf("Window size: %f, window start seqnum: %i, actual window start: %i, high_seq_num: %i\n", cwnd, start_seq_num, window_start->seqnum, high_seq_num);
+	    if (in_timeout) {
+		in_timeout = 0;
+		cur_window_seg = window_start;
+		if (start_seq_num < 2*WINDOW_SIZE && high_seq_num > MAX_SEQUENCE - (2*WINDOW_SIZE))
+		    cwnd_change = (MAX_SEQUENCE - high_seq_num + start_seq_num - 1);
+		else
+		    cwnd_change = start_seq_num - high_seq_num - 1;
+                for (int i = 0; i < (int)cwnd_change; ++i) {
+		    cur_window_seg->seqnum = 0;
+		    cur_window_seg->used = 0;
+                    cur_window_seg = cur_window_seg->next;
+		}
+                window_start = cur_window_seg;
+		high_seq_num = start_seq_num;
+	    }
+	}
     }
-         
-    printf("%zu\n", bytes_read);
+    
     fclose(fp);
     close(listen_sockfd);
     close(send_sockfd);

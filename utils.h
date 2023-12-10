@@ -12,25 +12,34 @@
 #define SERVER_PORT 6002
 #define CLIENT_PORT_TO 5001
 #define PAYLOAD_SIZE 1024
-#define WINDOW_SIZE 5
-#define TIMEOUT 2
+#define WINDOW_SIZE 5 
+#define TIMEOUT_SEC 0
+#define TIMEOUT_USEC 500000
 #define MAX_SEQUENCE 1024
-
 
 
 // Packet Layout
 // You may change this if you want to
 struct packet {
-    unsigned short seqnum;
-    unsigned short acknum;
+    unsigned int seqnum;
+    unsigned int acknum;
     char ack;
     char last;
     unsigned int length;
     char payload[PAYLOAD_SIZE];
 };
 
+struct queue {
+    char used;
+    char last;
+    unsigned int length;
+    unsigned int seqnum;
+    struct queue *next;
+    char payload[PAYLOAD_SIZE];
+};
+
 // Utility function to build a packet
-void build_packet(struct packet* pkt, unsigned short seqnum, unsigned short acknum, char last, char ack,unsigned int length, const char* payload) {
+void build_packet(struct packet* pkt, unsigned int seqnum, unsigned int acknum, char last, char ack,unsigned int length, const char* payload) {
     pkt->seqnum = seqnum;
     pkt->acknum = acknum;
     pkt->ack = ack;

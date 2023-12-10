@@ -6,47 +6,45 @@
 
 #include "utils.h"
 
-void send_ack(struct packet* pkt, unsigned short seqnum, unsigned short acknum, char last, char ack,unsigned int length, const char* payload, int send_sockfd) {
-    build_packet(pkt, seqnum, acknum, last, ack, length, payload);
-
-    // Send ACK segment to client socket
-    if (send(send_sockfd, pkt, sizeof(*pkt), 0) < 0) {
-	perror("Error sending ACK");
-	close(send_sockfd);
-	exit(1);
-    }
-}
-
-void write_to_output(FILE *fp, char *buffer) {
-    if (fwrite(buffer, 1, PAYLOAD_SIZE, fp) != PAYLOAD_SIZE) {
-	perror("File writing couldn't be completed");
-	fclose(fp);
-	exit(1);
-    }
-}
 
 // Slide client window, return number of segments in new window, returns number of places window slides 
-size_t slide_window(struct packet *window [WINDOW_SIZE-1], int used_segs[WINDOW_SIZE-1], FILE *fp) { 
+size_t slide_window(struct queue **window_start, FILE *fp) { 
+    if ((*window_start)->last) return 0;
     // Find first nonused segment in window
-    size_t i = 0;
-    for (; i < WINDOW_SIZE-1; ++i) {
-	if (!used_segs[i])
+    struct queue *cur_window_seg = *window_start;
+//    printf("Window\nOLD:   ");
+//    for (size_t j = 0; j < 6; ++j){
+//        printf("%i    ", cur_window_seg->seqnum);
+//        cur_window_seg = cur_window_seg->next;
+//    }
+    (*window_start)->used = 0;
+    (*window_start)->seqnum = 0;
+    (*window_start)->length = 0;
+    cur_window_seg = (*window_start)->next;
+    size_t i = 1;
+    for (;i < MAX_SEQUENCE; ++i) {
+	if (!cur_window_seg->used)
 	    break;
-	else
-	    write_to_output(fp, (*window[i]).payload);
-    }
-    size_t slide_start = i;
-    for (; i < WINDOW_SIZE-1; ++i) {
-	if (used_segs[i]) {
-    	    window[i-slide_start] = window[i];
-	    used_segs[i-slide_start] = 1;
-	} else {
-	    used_segs[i-slide_start] = 0;
+	else {
+	    int output = fwrite((const char *)cur_window_seg->payload, 1, cur_window_seg->length, fp);
+	    printf("WRITE %i\n", cur_window_seg->seqnum);
+	    cur_window_seg->used = 0;
+	    cur_window_seg->seqnum = 0;
+	    cur_window_seg->length = 0;
+	    if (cur_window_seg->last) {
+		break;
+            }
 	}
+	cur_window_seg = cur_window_seg->next;
     }
-    for (i = WINDOW_SIZE-1-slide_start; i < WINDOW_SIZE-1; ++i)
-	used_segs[i] = 0;    
-    return slide_start+1;
+    *window_start = cur_window_seg;
+//    printf("Window\nNEW:   ");
+//    for (size_t j = 0; j < 6; ++j){
+//	printf("%i    ", cur_window_seg->seqnum);
+//	cur_window_seg = cur_window_seg->next;
+//    }
+//    printf("\n");
+    return i;
 } 
 
 int main() {
@@ -55,10 +53,6 @@ int main() {
     struct packet buffer;
     socklen_t addr_size = sizeof(client_addr_from);
     int expected_seq_num = 0;
-    unsigned short seq_num = 0;
-    int recv_len;
-    char ack = 1;
-    char last = 0;
     struct packet ack_pkt;
 
     // Create a UDP socket for sending
@@ -95,56 +89,91 @@ int main() {
     client_addr_to.sin_port = htons(CLIENT_PORT_TO);
 
     // Open the target file for writing (always write to output.txt)
-    FILE *fp = fopen("output.txt", "w");
+    FILE *fp = fopen("output.txt", "wb");
 
     // TODO: Receive file from the client and save it as output.txt
-   
-    // Connect send socket to the client proxy address to which we will send data
-    if (connect(send_sockfd, (struct sockaddr *)&client_addr_to, sizeof(client_addr_to)) < 0) {
-	perror("Client failed to connect to proxy server");
-	close(send_sockfd);
-	return 1;
+    struct queue *window_start;
+    struct queue *cur_window_seg;
+    struct queue nodes[MAX_SEQUENCE];
+    for (size_t i = 0; i < MAX_SEQUENCE-1; ++i) {
+	nodes[i].next = &nodes[i+1];
+	nodes[i].used = 0;
+	nodes[i].seqnum = 0;
+	nodes[i].last = 0;
     }
+    nodes[MAX_SEQUENCE-1].next = &nodes[0];
+    nodes[MAX_SEQUENCE-1].used = 0;
+    window_start = &nodes[0];
+    int last_pkt = 0;
 
-    // Inefficient window buffer implementation
-    int used_segs[WINDOW_SIZE-1] = {0};
-    int window_change;
-    struct packet *window [WINDOW_SIZE-1]; 
-    while (1) { // TODO: implement FIN sequence
-	// Read from client
-	if (recv(listen_sockfd, &buffer, sizeof(buffer)-1, 0) <= 0) {
-	    printf("Read error or closed");
-	    close(listen_sockfd);
-	    return 1;
-	}
+    int window_change = 0;
+    while(1){
+        recvfrom(listen_sockfd, &buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr_from, &addr_size);
+	printRecv(&buffer);
+
+	if (buffer.acknum == 1 && buffer.last)
+	    break;
+
+	if (window_start->last) {
+	    build_packet(&ack_pkt, 1, expected_seq_num, 0, 1, 1, "0");
+	    sendto(send_sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&client_addr_to, addr_size);
+	    printSend(&ack_pkt, 0);
+	    continue;
+        }
 
 	window_change = 0;
-	// Handle seqnum with wraparound case included
 	if (buffer.seqnum > (MAX_SEQUENCE - 2*WINDOW_SIZE) && expected_seq_num < 2*WINDOW_SIZE)
             ; // seqnum is behind expectation in wraparound case, so ignore
-        else if (expected_seq_num > (MAX_SEQUENCE - 2*WINDOW_SIZE) && buffer.seqnum < 2*WINDOW_SIZE) {
+        else if (expected_seq_num > (MAX_SEQUENCE - 2*WINDOW_SIZE) && buffer.seqnum < 2*WINDOW_SIZE && (WINDOW_SIZE-expected_seq_num+buffer.seqnum)) {
 	    // Expectation is behind seqnum in wraparound case, so cache if possible
-	    if ((WINDOW_SIZE-expected_seq_num+buffer.seqnum)< WINDOW_SIZE) {
-	    	window[(size_t)(WINDOW_SIZE-expected_seq_num+buffer.seqnum-1)] = &buffer;
-		used_segs[(size_t)(WINDOW_SIZE-expected_seq_num+buffer.seqnum-1)] = 1;
-	}} else if (expected_seq_num < buffer.seqnum) {
+	    cur_window_seg = window_start;
+	    for (int i = 0; i < (int)(WINDOW_SIZE-expected_seq_num+buffer.seqnum); ++i) cur_window_seg = cur_window_seg->next;
+	    if (!cur_window_seg->used) {
+		memcpy(cur_window_seg->payload, buffer.payload, buffer.length);
+		cur_window_seg->seqnum = buffer.seqnum;
+		cur_window_seg->length = buffer.length;
+		cur_window_seg->used = 1;
+		cur_window_seg->last = buffer.last;
+	    }
+	} else if (expected_seq_num < (int)buffer.seqnum) {
 	    // Expectation is behind seqnum in traditional case, so cache if possible
-	    if ((buffer.seqnum-expected_seq_num) < WINDOW_SIZE) {
-		window[(size_t)(buffer.seqnum-expected_seq_num-1)] = &buffer;
-		used_segs[(size_t)(buffer.seqnum-expected_seq_num-1)] = 1;
-        }} else if (expected_seq_num > buffer.seqnum)
+	    cur_window_seg = window_start;
+	    for (int i = 0; i < (int)(buffer.seqnum-expected_seq_num); ++i) cur_window_seg = cur_window_seg->next;
+	    if (!cur_window_seg->used) {
+		memcpy(cur_window_seg->payload, buffer.payload, buffer.length);
+		cur_window_seg->seqnum = buffer.seqnum;
+		cur_window_seg->length = buffer.length;
+		cur_window_seg->used = 1;
+		cur_window_seg->last = buffer.last;
+ 	}} else if (expected_seq_num > (int)buffer.seqnum)
             ; // seqnum is behind expectation in traditional case, so ignore
-        else if (expected_seq_num == buffer.seqnum) {
-	   write_to_output(fp, buffer.payload);
-           window_change += slide_window(window, used_segs, fp); // Expected_seq_num is equals seqnum, so slide the window
+        else if (expected_seq_num == (int)buffer.seqnum) {
+	    if (window_start->used) {
+ 		printf("Shouldn't be possible! First seg of window is used!\n");
+		return 0;
+      	    }
+	    memcpy(window_start->payload, buffer.payload, buffer.length);
+	    window_start->seqnum = buffer.seqnum;
+	    window_start->length = buffer.length;
+	    window_start->last = buffer.last;
+	    int output = fwrite((const char *)window_start->payload, 1, window_start->length, fp);
+	    printf("WRITE %i\n", window_start->seqnum);
+            window_change += slide_window(&window_start, fp); // Expected_seq_num is equals seqnum, so slide the window
 	} else
-           printf("Don't think this is a possible case\n");
+	    return 0; // Don't think this is possible
 
-	// Send ACK
 	expected_seq_num = (expected_seq_num + window_change) % MAX_SEQUENCE;
-	send_ack(&ack_pkt, seq_num, expected_seq_num, last, ack, 0, NULL, send_sockfd);
-    }   
-
+	if (window_start->last) {
+            build_packet(&ack_pkt, 1, expected_seq_num, 0, 1, 1, "0");
+            sendto(send_sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&client_addr_to, addr_size);
+	    printSend(&ack_pkt, 0);
+            continue;
+        }
+        build_packet(&ack_pkt, 0, expected_seq_num, 0, 1, 1, "0");
+        sendto(send_sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&client_addr_to, addr_size);
+	printSend(&ack_pkt, 0);
+    }
+    
     fclose(fp);
     close(listen_sockfd);
     close(send_sockfd);
